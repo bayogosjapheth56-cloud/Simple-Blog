@@ -1,12 +1,15 @@
 <?php
 // edit.php - UPDATE (edit existing post with photo support)
 require_once "db_connect.php";
+require_once "includes/functions.php";
+require_once "includes/upload_helper.php";
 $pageTitle = "Edit Post";
 $errors = [];
 
 $id = (int) ($_GET["id"] ?? $_POST["id"] ?? 0);
 
-$stmt = mysqli_prepare($conn, "SELECT * FROM posts WHERE id = ?");
+// Load the post together with its category name (JOIN with categories)
+$stmt = mysqli_prepare($conn, POST_SELECT_SQL . " WHERE p.id = ?");
 mysqli_stmt_bind_param($stmt, "i", $id);
 mysqli_stmt_execute($stmt);
 $post = mysqli_fetch_assoc(mysqli_stmt_get_result($stmt));
@@ -24,75 +27,54 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     $status = $_POST["status"] ?? "Draft";
     $removePhoto = isset($_POST["remove_photo"]) && $_POST["remove_photo"] === "1";
 
-    if ($title === "")
-        $errors[] = "Title is required.";
-    if ($author === "")
-        $errors[] = "Author is required.";
-    if ($category === "")
-        $errors[] = "Category is required.";
-    if ($content === "")
-        $errors[] = "Content is required.";
-    if (!in_array($status, ["Draft", "Published"]))
+    if (!csrf_valid()) {
+        $errors[] = "Your session expired. Please submit the form again.";
+    } else {
+        $errors = validate_post_fields($title, $author, $category, $content);
+    }
+    if (!in_array($status, ["Draft", "Published"], true))
         $status = "Draft";
 
     $oldImage = $post["image"];   // photo currently saved in the database
     $imageName = $oldImage;        // photo that will be saved
-    $uploadedNew = null;             // newly uploaded file (deleted again if saving fails)
+    $uploadedNew = null;           // newly uploaded file (deleted again if saving fails)
 
-    // Handle new photo upload
-    if (isset($_FILES["image"]) && $_FILES["image"]["error"] !== UPLOAD_ERR_NO_FILE) {
-        $file = $_FILES["image"];
-        if ($file["error"] === UPLOAD_ERR_OK) {
-            $allowed = ["jpg", "jpeg", "png", "gif", "webp"];
-            $ext = strtolower(pathinfo($file["name"], PATHINFO_EXTENSION));
-            $maxSize = 5 * 1024 * 1024; // 5MB
-
-            if (!in_array($ext, $allowed)) {
-                $errors[] = "Invalid image type. Allowed: JPG, PNG, GIF, WebP.";
-            } elseif ($file["size"] > $maxSize) {
-                $errors[] = "Image file is too large. Maximum size is 5MB.";
-            } elseif (@getimagesize($file["tmp_name"]) === false) {
-                $errors[] = "File is not a valid image.";
-            } else {
-                if (!is_dir("uploads")) {
-                    mkdir("uploads", 0777, true);
-                }
-                $newImageName = "post_" . time() . "_" . bin2hex(random_bytes(4)) . "." . $ext;
-                $targetPath = "uploads/" . $newImageName;
-                if (move_uploaded_file($file["tmp_name"], $targetPath)) {
-                    $uploadedNew = $newImageName;
-                    $imageName = $newImageName;   // old file is NOT deleted yet
-                } else {
-                    $errors[] = "Failed to save uploaded photo.";
-                }
-            }
-        } else {
-            $errors[] = "An error occurred while uploading the photo.";
+    // Handle new photo upload only when the form itself is valid
+    // (shared validation in includes/upload_helper.php)
+    if (empty($errors) && isset($_FILES["image"]) && $_FILES["image"]["error"] !== UPLOAD_ERR_NO_FILE) {
+        $uploadedNew = save_uploaded_image($_FILES["image"], $errors);
+        if ($uploadedNew) {
+            $imageName = $uploadedNew;   // old file is NOT deleted yet
         }
     } elseif ($removePhoto) {
-        $imageName = null;                          // old file is NOT deleted yet
+        $imageName = null;               // old file is NOT deleted yet
     }
 
     // keep what the user typed if there are errors
     $post = array_merge($post, compact("title", "author", "category", "content", "status"));
 
     if (empty($errors)) {
+        // Look up the category in the categories table (created if it is new)
+        $categoryId = get_or_create_category($conn, $category);
+
         $stmt = mysqli_prepare(
             $conn,
-            "UPDATE posts SET title=?, author=?, category=?, content=?, status=?, image=? WHERE id=?"
+            "UPDATE posts SET title=?, author=?, category_id=?, content=?, status=?, image=? WHERE id=?"
         );
-        mysqli_stmt_bind_param($stmt, "ssssssi", $title, $author, $category, $content, $status, $imageName, $id);
+        mysqli_stmt_bind_param($stmt, "ssisssi", $title, $author, $categoryId, $content, $status, $imageName, $id);
 
-        if (mysqli_stmt_execute($stmt)) {
+        if ($categoryId !== null && mysqli_stmt_execute($stmt)) {
             // Update succeeded, so it is now safe to remove the old photo file
             if (!empty($oldImage) && $oldImage !== $imageName && file_exists("uploads/" . $oldImage)) {
                 @unlink("uploads/" . $oldImage);
             }
             header("Location: index.php?msg=" . urlencode("Post updated successfully!"));
             exit;
-        } else {
-            $errors[] = "Database error: " . mysqli_error($conn);
         }
+
+        // Log the details for the developer, show a friendly message to the user
+        error_log("Post update failed: " . mysqli_error($conn));
+        $errors[] = "The post could not be saved. Please try again.";
     }
 
     // Something failed: discard the newly uploaded file so no orphan is left behind
@@ -101,16 +83,18 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     }
 }
 
+$allCategories = get_all_categories($conn);
+
 include "includes/header.php";
 ?>
 
 <div class="mb-4">
-    <h1 class="page-heading mb-1">Edit Post #<?= $post["id"] ?></h1>
-    <div class="post-count-subtitle">Modify the details of this blog post</div>
+    <h1 class="h2 fw-bold mb-1">Edit Post</h1>
+    <div class="text-secondary small">Modify the details of this blog post</div>
 </div>
 
 <?php if ($errors): ?>
-    <div class="alert alert-custom-danger mb-4">
+    <div class="alert alert-danger mb-4">
         <ul class="mb-0 ps-3">
             <?php foreach ($errors as $e): ?>
                 <li><?= htmlspecialchars($e) ?></li>
@@ -119,29 +103,32 @@ include "includes/header.php";
     </div>
 <?php endif; ?>
 
-<div class="table-card p-4">
+<div class="card shadow-sm border-0 rounded-4 p-4">
     <form method="post" enctype="multipart/form-data">
-        <input type="hidden" name="id" value="<?= $post["id"] ?>">
+        <input type="hidden" name="id" value="<?= (int) $post["id"] ?>">
+        <?= csrf_field() ?>
 
         <div class="mb-3">
-            <label class="form-label">Title</label>
+            <label class="form-label fw-bold">Title</label>
             <input type="text" name="title" class="form-control" maxlength="150"
                 value="<?= htmlspecialchars($post["title"]) ?>" required>
         </div>
 
         <div class="row">
             <div class="col-md-4 mb-3">
-                <label class="form-label">Author</label>
-                <input type="text" name="author" class="form-control" value="<?= htmlspecialchars($post["author"]) ?>"
-                    required>
+                <label class="form-label fw-bold">Author</label>
+                <input type="text" name="author" class="form-control" maxlength="100"
+                    value="<?= htmlspecialchars($post["author"]) ?>" required>
             </div>
             <div class="col-md-4 mb-3">
-                <label class="form-label">Category</label>
-                <input type="text" name="category" class="form-control"
+                <label class="form-label fw-bold">Category</label>
+                <!-- Pick an existing category or type a new one (saved in the categories table) -->
+                <input type="text" name="category" class="form-control" maxlength="50" list="categoryOptions"
                     value="<?= htmlspecialchars($post["category"]) ?>" required>
+                <?php include "includes/category_datalist.php"; ?>
             </div>
             <div class="col-md-4 mb-3">
-                <label class="form-label">Status</label>
+                <label class="form-label fw-bold">Status</label>
                 <select name="status" class="form-select">
                     <option value="Draft" <?= $post["status"] === "Draft" ? "selected" : "" ?>>Draft</option>
                     <option value="Published" <?= $post["status"] === "Published" ? "selected" : "" ?>>Published</option>
@@ -151,13 +138,13 @@ include "includes/header.php";
 
         <!-- Featured Photo Section -->
         <div class="mb-3">
-            <label class="form-label d-block">Featured Photo</label>
+            <label class="form-label fw-bold d-block">Featured Photo</label>
 
             <?php if (!empty($post["image"]) && file_exists("uploads/" . $post["image"])): ?>
                 <div id="currentPhotoContainer" class="mb-3">
-                    <div class="photo-preview-wrapper mb-2">
+                    <div class="mb-2">
                         <img src="uploads/<?= htmlspecialchars($post["image"]) ?>" alt="Current photo"
-                            class="photo-preview-img shadow-sm">
+                            class="img-fluid rounded-3 border shadow-sm" style="max-height: 240px;">
                     </div>
                     <div class="form-check">
                         <input class="form-check-input" type="checkbox" name="remove_photo" value="1" id="removePhotoCheck">
@@ -169,35 +156,34 @@ include "includes/header.php";
             <?php endif; ?>
 
             <div class="d-flex align-items-center flex-wrap gap-3">
-                <label for="imageUpload" class="btn btn-add-photo">
-                    <i class="bi bi-image me-2"></i>
+                <label for="imageUpload" class="btn-add-photo">
+                    <i class="bi bi-image fs-5"></i>
                     <span><?= !empty($post["image"]) ? "Change photo" : "Add photo" ?></span>
                 </label>
                 <input type="file" name="image" id="imageUpload"
                     accept="image/png, image/jpeg, image/jpg, image/gif, image/webp" class="d-none">
-                <span id="fileNameDisplay" class="text-muted small">No new photo chosen</span>
-                <button type="button" id="removePhotoBtn" class="btn btn-sm btn-action-delete d-none">
+                <span id="fileNameDisplay" class="text-secondary small">No new photo chosen</span>
+                <button type="button" id="removePhotoBtn" class="btn btn-sm btn-outline-danger d-none">
                     <i class="bi bi-x-circle me-1"></i> Cancel selection
                 </button>
             </div>
 
             <!-- New Image Preview -->
             <div id="imagePreviewContainer" class="mt-3 d-none">
-                <div class="photo-preview-wrapper">
-                    <img id="imagePreview" src="#" alt="Preview" class="photo-preview-img shadow-sm">
-                </div>
+                <img id="imagePreview" src="#" alt="Preview" class="img-fluid rounded-3 border shadow-sm"
+                    style="max-height: 240px;">
             </div>
         </div>
 
         <div class="mb-4">
-            <label class="form-label">Content</label>
+            <label class="form-label fw-bold">Content</label>
             <textarea name="content" rows="8" class="form-control"
                 required><?= htmlspecialchars($post["content"]) ?></textarea>
         </div>
 
         <div class="d-flex gap-2">
-            <button type="submit" class="btn btn-purple">Update Post</button>
-            <a href="index.php" class="btn btn-action-edit text-decoration-none">Cancel</a>
+            <button type="submit" class="btn btn-purple px-4">Update Post</button>
+            <a href="index.php" class="btn btn-secondary px-4 text-decoration-none">Cancel</a>
         </div>
     </form>
 </div>
