@@ -3,7 +3,7 @@
 A web-based CRUD application for writing, organising and publishing blog posts.
 Built with **PHP**, **MySQL**, **HTML/CSS** and **Bootstrap 5** for the Web Systems Technologies final project.
 
-**Live site:** _add your InfinityFree URL here_
+**Live site:** japheth.lovestoblog.com
 
 ## Features
 
@@ -64,3 +64,7 @@ uploads/                   Uploaded post photos
 4. Put the InfinityFree hostname, username, password and database name in `db_connect.php`.
 5. Upload all project files to `htdocs/` with the File Manager (include the empty `uploads/` folder).
 6. Open your live URL and test adding, viewing, editing and deleting a post.
+
+
+
+Japheth Bayogos BSIT 3A-SD
